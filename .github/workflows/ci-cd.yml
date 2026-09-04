@@ -1,0 +1,144 @@
+name: CI/CD
+run-name: CI/CD for ${{ github.ref_name }} by ${{ github.actor }}
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+concurrency:
+  group: opsboard-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  validate:
+    name: Validate, Test, And Build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: backend/package-lock.json
+
+      - name: Install backend dependencies
+        run: npm ci --prefix backend
+
+      - name: Lint and test
+        run: npm run check --prefix backend
+
+      - name: Dependency audit
+        run: npm audit --audit-level=high --prefix backend
+
+      - name: Validate Docker Compose
+        run: docker compose config
+
+      - name: Build backend Docker image
+        run: docker build --file backend/Dockerfile --tag opsboard-backend:${{ github.sha }} .
+
+      - name: Build frontend Docker image
+        run: docker build --file frontend/Dockerfile --tag opsboard-frontend:${{ github.sha }} .
+
+  deploy:
+    name: Deploy To Azure
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+    needs: validate
+    runs-on: ubuntu-latest
+    environment:
+      name: production
+      url: ${{ steps.smoke.outputs.app-url }}
+    env:
+      ACR_NAME: ${{ vars.AZURE_ACR_NAME }}
+      BACKEND_CONTAINER_APP_NAME: ${{ vars.AZURE_BACKEND_CONTAINER_APP_NAME }}
+      BACKEND_IMAGE_NAME: opsboard-backend
+      FRONTEND_CONTAINER_APP_NAME: ${{ vars.AZURE_FRONTEND_CONTAINER_APP_NAME }}
+      FRONTEND_IMAGE_NAME: opsboard-frontend
+      RESOURCE_GROUP: ${{ vars.AZURE_RESOURCE_GROUP }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Validate required configuration
+        run: |
+          test -n "$ACR_NAME"
+          test -n "$BACKEND_CONTAINER_APP_NAME"
+          test -n "$FRONTEND_CONTAINER_APP_NAME"
+          test -n "$RESOURCE_GROUP"
+
+      - name: Azure login
+        uses: azure/login@v3
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Login to Azure Container Registry
+        run: az acr login --name "$ACR_NAME"
+
+      - name: Build and push images
+        run: |
+          LOGIN_SERVER=$(az acr show --name "$ACR_NAME" --query loginServer -o tsv)
+          BACKEND_IMAGE="$LOGIN_SERVER/$BACKEND_IMAGE_NAME:${GITHUB_SHA}"
+          FRONTEND_IMAGE="$LOGIN_SERVER/$FRONTEND_IMAGE_NAME:${GITHUB_SHA}"
+          docker build --file backend/Dockerfile --tag "$BACKEND_IMAGE" .
+          docker build --file frontend/Dockerfile --tag "$FRONTEND_IMAGE" .
+          docker push "$BACKEND_IMAGE"
+          docker push "$FRONTEND_IMAGE"
+          echo "BACKEND_IMAGE=$BACKEND_IMAGE" >> "$GITHUB_ENV"
+          echo "FRONTEND_IMAGE=$FRONTEND_IMAGE" >> "$GITHUB_ENV"
+
+      - name: Deploy backend revision
+        run: |
+          az containerapp update \
+            --name "$BACKEND_CONTAINER_APP_NAME" \
+            --resource-group "$RESOURCE_GROUP" \
+            --image "$BACKEND_IMAGE" \
+            --set-env-vars APP_VERSION="${GITHUB_SHA}" NODE_ENV=production
+
+      - name: Deploy frontend revision
+        run: |
+          BACKEND_FQDN=$(az containerapp show \
+            --name "$BACKEND_CONTAINER_APP_NAME" \
+            --resource-group "$RESOURCE_GROUP" \
+            --query properties.configuration.ingress.fqdn \
+            -o tsv)
+          az containerapp update \
+            --name "$FRONTEND_CONTAINER_APP_NAME" \
+            --resource-group "$RESOURCE_GROUP" \
+            --image "$FRONTEND_IMAGE" \
+            --set-env-vars APP_VERSION="${GITHUB_SHA}" NODE_ENV=production BACKEND_ORIGIN="https://$BACKEND_FQDN" PORT=8080
+
+      - name: Smoke test public URL
+        id: smoke
+        run: |
+          FQDN=$(az containerapp show \
+            --name "$FRONTEND_CONTAINER_APP_NAME" \
+            --resource-group "$RESOURCE_GROUP" \
+            --query properties.configuration.ingress.fqdn \
+            -o tsv)
+          URL="https://$FQDN"
+          echo "APP_URL=$URL" >> "$GITHUB_ENV"
+          echo "app-url=$URL" >> "$GITHUB_OUTPUT"
+          curl --retry 12 --retry-delay 10 --retry-all-errors --fail "$URL/healthz"
+          curl --retry 12 --retry-delay 10 --retry-all-errors --fail "$URL/readyz"
+
+      - name: Write deployment summary
+        run: |
+          {
+            echo "## Azure deployment"
+            echo ""
+            echo "- Backend image: \`$BACKEND_IMAGE\`"
+            echo "- Frontend image: \`$FRONTEND_IMAGE\`"
+            echo "- URL: $APP_URL"
+            echo "- Smoke checks: /healthz and /readyz passed"
+          } >> "$GITHUB_STEP_SUMMARY"

@@ -1,0 +1,221 @@
+openapi: 3.1.0
+info:
+  title: OpsBoard API
+  version: 1.0.0
+  description: Incident board API for the Azure production exercise.
+servers:
+  - url: http://localhost:8080
+    description: Local development
+security:
+  - bearerAuth: []
+paths:
+  /healthz:
+    get:
+      summary: Liveness probe
+      security: []
+      responses:
+        "200":
+          description: Service is alive
+  /readyz:
+    get:
+      summary: Readiness probe
+      security: []
+      responses:
+        "200":
+          description: Dependencies are reachable
+  /metrics:
+    get:
+      summary: Prometheus metrics
+      security: []
+      responses:
+        "200":
+          description: Text metrics
+          content:
+            text/plain:
+              schema:
+                type: string
+  /api/incidents:
+    get:
+      summary: List incidents
+      security: []
+      parameters:
+        - name: status
+          in: query
+          schema:
+            $ref: "#/components/schemas/IncidentStatus"
+        - name: priority
+          in: query
+          schema:
+            $ref: "#/components/schemas/IncidentPriority"
+        - name: q
+          in: query
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Incidents
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  incidents:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/Incident"
+    post:
+      summary: Create incident
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreateIncidentRequest"
+      responses:
+        "201":
+          description: Created incident
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  incident:
+                    $ref: "#/components/schemas/Incident"
+        "400":
+          $ref: "#/components/responses/ValidationError"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+  /api/incidents/{id}/status:
+    patch:
+      summary: Update incident status
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - status
+              properties:
+                status:
+                  $ref: "#/components/schemas/IncidentStatus"
+      responses:
+        "200":
+          description: Updated incident
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  incident:
+                    $ref: "#/components/schemas/Incident"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          description: Incident not found
+  /api/stats:
+    get:
+      summary: Incident summary
+      security: []
+      responses:
+        "200":
+          description: Summary stats
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  stats:
+                    $ref: "#/components/schemas/IncidentStats"
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+  responses:
+    Unauthorized:
+      description: Bearer token is missing or invalid
+    ValidationError:
+      description: Request validation failed
+  schemas:
+    CreateIncidentRequest:
+      type: object
+      required:
+        - title
+      properties:
+        title:
+          type: string
+          minLength: 3
+          maxLength: 120
+        description:
+          type: string
+          maxLength: 1000
+        owner:
+          type: string
+          maxLength: 80
+        priority:
+          $ref: "#/components/schemas/IncidentPriority"
+    Incident:
+      type: object
+      required:
+        - id
+        - title
+        - description
+        - priority
+        - status
+        - owner
+        - createdAt
+        - updatedAt
+      properties:
+        id:
+          type: string
+        title:
+          type: string
+        description:
+          type: string
+        priority:
+          $ref: "#/components/schemas/IncidentPriority"
+        status:
+          $ref: "#/components/schemas/IncidentStatus"
+        owner:
+          type: string
+        createdAt:
+          type: string
+          format: date-time
+        updatedAt:
+          type: string
+          format: date-time
+    IncidentPriority:
+      type: string
+      enum:
+        - low
+        - medium
+        - high
+        - critical
+    IncidentStatus:
+      type: string
+      enum:
+        - open
+        - in_progress
+        - resolved
+    IncidentStats:
+      type: object
+      properties:
+        total:
+          type: integer
+        openCritical:
+          type: integer
+        byStatus:
+          type: object
+          additionalProperties:
+            type: integer
+        byPriority:
+          type: object
+          additionalProperties:
+            type: integer
