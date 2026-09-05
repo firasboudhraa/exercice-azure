@@ -16,10 +16,10 @@ $env:ADMIN_TOKEN="change-me-local"
 npm run load:local
 ```
 
-Run against Azure:
+Run against AWS:
 
 ```powershell
-$env:TARGET_URL="https://YOUR_CONTAINER_APP_URL"
+$env:TARGET_URL="http://YOUR_LOAD_BALANCER_DNS"
 $env:DURATION_SECONDS="60"
 $env:CONCURRENCY="50"
 $env:WRITE_RATIO="0.02"
@@ -32,33 +32,34 @@ What to capture in the final README or submission notes:
 - Requests per second.
 - Failed request count.
 - p50 and p95 latency.
-- Azure Container Apps replica count before and during load.
-- Any bottleneck observed in logs or metrics.
+- ECS desired task count and running task count before and during load.
+- CloudWatch logs for backend errors or slow requests.
+- Any bottleneck observed in `/metrics`.
 
-Recommended scaling rule for the public frontend app:
-
-```powershell
-az containerapp update `
-  --name opsboard `
-  --resource-group rg-opsboard `
-  --min-replicas 1 `
-  --max-replicas 5 `
-  --scale-rule-name http-scale `
-  --scale-rule-http-concurrency 50
-```
-
-Azure Container Apps supports HTTP scaling based on concurrent requests, so both app containers use simple HTTP concurrency thresholds.
-
-Recommended scaling rule for the internal backend API app:
+Recommended manual scaling commands for the exercise:
 
 ```powershell
-az containerapp update `
-  --name opsboard-api `
-  --resource-group rg-opsboard `
-  --min-replicas 1 `
-  --max-replicas 5 `
-  --scale-rule-name http-scale `
-  --scale-rule-http-concurrency 50
+aws ecs update-service `
+  --cluster opsboard-cluster `
+  --service opsboard-api `
+  --desired-count 2 `
+  --region eu-west-3
+
+aws ecs update-service `
+  --cluster opsboard-cluster `
+  --service opsboard `
+  --desired-count 2 `
+  --region eu-west-3
 ```
 
-The frontend uses public HTTP ingress. The backend uses internal HTTP ingress and scales independently.
+Recommended status checks:
+
+```powershell
+aws ecs describe-services `
+  --cluster opsboard-cluster `
+  --services opsboard-api opsboard `
+  --region eu-west-3 `
+  --query "services[].{service:serviceName,desired:desiredCount,running:runningCount,pending:pendingCount}"
+```
+
+The deployed stack also includes target-tracking autoscaling policies for both ECS services. PostgreSQL is shared persistence, so multiple backend tasks can safely serve traffic concurrently.

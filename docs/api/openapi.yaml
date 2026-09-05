@@ -2,7 +2,7 @@ openapi: 3.1.0
 info:
   title: OpsBoard API
   version: 1.0.0
-  description: Incident board API for the Azure production exercise.
+  description: Incident board API for the AWS production exercise.
 servers:
   - url: http://localhost:8080
     description: Local development

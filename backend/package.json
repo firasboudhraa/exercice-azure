@@ -1,7 +1,7 @@
 {
   "name": "opsboard",
   "version": "1.0.0",
-  "description": "Azure-ready incident board exercise app with UI, backend API, PostgreSQL, tests, Docker, CI/CD, and deployment scripts.",
+  "description": "AWS-ready incident board exercise app with UI, backend API, PostgreSQL, tests, Docker, CI/CD, and deployment scripts.",
   "type": "module",
   "engines": {
     "node": ">=22"

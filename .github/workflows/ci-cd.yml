@@ -50,46 +50,54 @@ jobs:
         run: docker build --file frontend/Dockerfile --tag opsboard-frontend:${{ github.sha }} .
 
   deploy:
-    name: Deploy To Azure
+    name: Deploy To AWS
     if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
     needs: validate
     runs-on: ubuntu-latest
-    environment:
-      name: production
-      url: ${{ steps.smoke.outputs.app-url }}
     env:
-      ACR_NAME: ${{ vars.AZURE_ACR_NAME }}
-      BACKEND_CONTAINER_APP_NAME: ${{ vars.AZURE_BACKEND_CONTAINER_APP_NAME }}
-      BACKEND_IMAGE_NAME: opsboard-backend
-      FRONTEND_CONTAINER_APP_NAME: ${{ vars.AZURE_FRONTEND_CONTAINER_APP_NAME }}
-      FRONTEND_IMAGE_NAME: opsboard-frontend
-      RESOURCE_GROUP: ${{ vars.AZURE_RESOURCE_GROUP }}
+      AWS_REGION: ${{ vars.AWS_REGION }}
+      AWS_STACK_NAME: ${{ vars.AWS_STACK_NAME }}
+      AWS_ROLE_TO_ASSUME: ${{ secrets.AWS_ROLE_TO_ASSUME }}
+      BACKEND_CONTAINER_NAME: backend
+      BACKEND_REPOSITORY: ${{ vars.AWS_ECR_BACKEND_REPOSITORY }}
+      BACKEND_SERVICE: ${{ vars.AWS_ECS_BACKEND_SERVICE }}
+      BACKEND_TASK_FAMILY: ${{ vars.AWS_BACKEND_TASK_FAMILY }}
+      ECS_CLUSTER: ${{ vars.AWS_ECS_CLUSTER }}
+      FRONTEND_CONTAINER_NAME: frontend
+      FRONTEND_REPOSITORY: ${{ vars.AWS_ECR_FRONTEND_REPOSITORY }}
+      FRONTEND_SERVICE: ${{ vars.AWS_ECS_FRONTEND_SERVICE }}
+      FRONTEND_TASK_FAMILY: ${{ vars.AWS_FRONTEND_TASK_FAMILY }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
       - name: Validate required configuration
         run: |
-          test -n "$ACR_NAME"
-          test -n "$BACKEND_CONTAINER_APP_NAME"
-          test -n "$FRONTEND_CONTAINER_APP_NAME"
-          test -n "$RESOURCE_GROUP"
+          test -n "$AWS_REGION"
+          test -n "$AWS_STACK_NAME"
+          test -n "$AWS_ROLE_TO_ASSUME"
+          test -n "$BACKEND_REPOSITORY"
+          test -n "$BACKEND_SERVICE"
+          test -n "$BACKEND_TASK_FAMILY"
+          test -n "$ECS_CLUSTER"
+          test -n "$FRONTEND_REPOSITORY"
+          test -n "$FRONTEND_SERVICE"
+          test -n "$FRONTEND_TASK_FAMILY"
 
-      - name: Azure login
-        uses: azure/login@v3
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v6.2.4
         with:
-          client-id: ${{ secrets.AZURE_CLIENT_ID }}
-          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
-          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+          role-to-assume: ${{ secrets.AWS_ROLE_TO_ASSUME }}
+          aws-region: ${{ vars.AWS_REGION }}
 
-      - name: Login to Azure Container Registry
-        run: az acr login --name "$ACR_NAME"
+      - name: Login to Amazon ECR
+        id: ecr
+        uses: aws-actions/amazon-ecr-login@v2
 
       - name: Build and push images
         run: |
-          LOGIN_SERVER=$(az acr show --name "$ACR_NAME" --query loginServer -o tsv)
-          BACKEND_IMAGE="$LOGIN_SERVER/$BACKEND_IMAGE_NAME:${GITHUB_SHA}"
-          FRONTEND_IMAGE="$LOGIN_SERVER/$FRONTEND_IMAGE_NAME:${GITHUB_SHA}"
+          BACKEND_IMAGE="${{ steps.ecr.outputs.registry }}/$BACKEND_REPOSITORY:${GITHUB_SHA}"
+          FRONTEND_IMAGE="${{ steps.ecr.outputs.registry }}/$FRONTEND_REPOSITORY:${GITHUB_SHA}"
           docker build --file backend/Dockerfile --tag "$BACKEND_IMAGE" .
           docker build --file frontend/Dockerfile --tag "$FRONTEND_IMAGE" .
           docker push "$BACKEND_IMAGE"
@@ -97,45 +105,95 @@ jobs:
           echo "BACKEND_IMAGE=$BACKEND_IMAGE" >> "$GITHUB_ENV"
           echo "FRONTEND_IMAGE=$FRONTEND_IMAGE" >> "$GITHUB_ENV"
 
-      - name: Deploy backend revision
+      - name: Deploy backend task definition
         run: |
-          az containerapp update \
-            --name "$BACKEND_CONTAINER_APP_NAME" \
-            --resource-group "$RESOURCE_GROUP" \
-            --image "$BACKEND_IMAGE" \
-            --set-env-vars APP_VERSION="${GITHUB_SHA}" NODE_ENV=production
+          aws ecs describe-task-definition \
+            --task-definition "$BACKEND_TASK_FAMILY" \
+            --query taskDefinition \
+            --output json \
+            > backend-task-definition.json
 
-      - name: Deploy frontend revision
+          jq \
+            --arg image "$BACKEND_IMAGE" \
+            --arg version "$GITHUB_SHA" \
+            --arg container "$BACKEND_CONTAINER_NAME" \
+            '
+            .containerDefinitions = (.containerDefinitions | map(
+              if .name == $container then
+                .image = $image
+                | .environment = ((.environment // []) | map(if .name == "APP_VERSION" then .value = $version else . end))
+              else
+                .
+              end
+            ))
+            | del(.taskDefinitionArn, .revision, .status, .requiresAttributes, .compatibilities, .registeredAt, .registeredBy)
+            ' backend-task-definition.json > backend-task-definition-next.json
+
+          BACKEND_TASK_DEFINITION_ARN=$(aws ecs register-task-definition \
+            --cli-input-json file://backend-task-definition-next.json \
+            --query "taskDefinition.taskDefinitionArn" \
+            --output text)
+
+          aws ecs update-service \
+            --cluster "$ECS_CLUSTER" \
+            --service "$BACKEND_SERVICE" \
+            --task-definition "$BACKEND_TASK_DEFINITION_ARN"
+
+      - name: Deploy frontend task definition
         run: |
-          BACKEND_FQDN=$(az containerapp show \
-            --name "$BACKEND_CONTAINER_APP_NAME" \
-            --resource-group "$RESOURCE_GROUP" \
-            --query properties.configuration.ingress.fqdn \
-            -o tsv)
-          az containerapp update \
-            --name "$FRONTEND_CONTAINER_APP_NAME" \
-            --resource-group "$RESOURCE_GROUP" \
-            --image "$FRONTEND_IMAGE" \
-            --set-env-vars APP_VERSION="${GITHUB_SHA}" NODE_ENV=production BACKEND_ORIGIN="https://$BACKEND_FQDN" PORT=8080
+          aws ecs describe-task-definition \
+            --task-definition "$FRONTEND_TASK_FAMILY" \
+            --query taskDefinition \
+            --output json \
+            > frontend-task-definition.json
+
+          jq \
+            --arg image "$FRONTEND_IMAGE" \
+            --arg version "$GITHUB_SHA" \
+            --arg container "$FRONTEND_CONTAINER_NAME" \
+            '
+            .containerDefinitions = (.containerDefinitions | map(
+              if .name == $container then
+                .image = $image
+                | .environment = ((.environment // []) | map(if .name == "APP_VERSION" then .value = $version else . end))
+              else
+                .
+              end
+            ))
+            | del(.taskDefinitionArn, .revision, .status, .requiresAttributes, .compatibilities, .registeredAt, .registeredBy)
+            ' frontend-task-definition.json > frontend-task-definition-next.json
+
+          FRONTEND_TASK_DEFINITION_ARN=$(aws ecs register-task-definition \
+            --cli-input-json file://frontend-task-definition-next.json \
+            --query "taskDefinition.taskDefinitionArn" \
+            --output text)
+
+          aws ecs update-service \
+            --cluster "$ECS_CLUSTER" \
+            --service "$FRONTEND_SERVICE" \
+            --task-definition "$FRONTEND_TASK_DEFINITION_ARN"
+
+      - name: Wait for ECS services
+        run: |
+          aws ecs wait services-stable --cluster "$ECS_CLUSTER" --services "$BACKEND_SERVICE"
+          aws ecs wait services-stable --cluster "$ECS_CLUSTER" --services "$FRONTEND_SERVICE"
 
       - name: Smoke test public URL
         id: smoke
         run: |
-          FQDN=$(az containerapp show \
-            --name "$FRONTEND_CONTAINER_APP_NAME" \
-            --resource-group "$RESOURCE_GROUP" \
-            --query properties.configuration.ingress.fqdn \
-            -o tsv)
-          URL="https://$FQDN"
-          echo "APP_URL=$URL" >> "$GITHUB_ENV"
-          echo "app-url=$URL" >> "$GITHUB_OUTPUT"
-          curl --retry 12 --retry-delay 10 --retry-all-errors --fail "$URL/healthz"
-          curl --retry 12 --retry-delay 10 --retry-all-errors --fail "$URL/readyz"
+          APP_URL=$(aws cloudformation describe-stacks \
+            --stack-name "$AWS_STACK_NAME" \
+            --query "Stacks[0].Outputs[?OutputKey=='ApplicationUrl'].OutputValue | [0]" \
+            --output text)
+          echo "APP_URL=$APP_URL" >> "$GITHUB_ENV"
+          echo "app-url=$APP_URL" >> "$GITHUB_OUTPUT"
+          curl --retry 12 --retry-delay 10 --retry-all-errors --fail "$APP_URL/healthz"
+          curl --retry 12 --retry-delay 10 --retry-all-errors --fail "$APP_URL/readyz"
 
       - name: Write deployment summary
         run: |
           {
-            echo "## Azure deployment"
+            echo "## AWS deployment"
             echo ""
             echo "- Backend image: \`$BACKEND_IMAGE\`"
             echo "- Frontend image: \`$FRONTEND_IMAGE\`"
